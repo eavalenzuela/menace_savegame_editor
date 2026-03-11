@@ -118,6 +118,59 @@ class Vehicle:
 
 
 @dataclass
+class EquipmentSlot:
+    """A single equipment slot for a squad leader."""
+    slot_id: int
+    uuids: list[str] = field(default_factory=list)
+
+    def serialize(self) -> bytes:
+        out = write_u32(self.slot_id) + write_u32(len(self.uuids))
+        for u in self.uuids:
+            out += write_string(u)
+        return out
+
+
+@dataclass
+class SquadLeader:
+    """A squad leader or pilot entry."""
+    class_type: str        # "Infantry" or "Vehicle"
+    leader_id: str         # e.g. "squad_leader.darby", "pilot.rewa"
+    stats: list[float] = field(default_factory=list)   # 7 f32 values
+    perks: list[str] = field(default_factory=list)
+    equipment: list[EquipmentSlot] = field(default_factory=list)
+    mid_blob: bytes = b''  # mission history, battle stats (unparsed)
+    status: str = 'Alive'
+    known_leaders: list[int] = field(default_factory=list)  # u32 IDs
+
+    @property
+    def display_name(self) -> str:
+        """Human-readable name from leader_id."""
+        # "squad_leader.darby" -> "Darby", "pilot.rewa" -> "Rewa"
+        name = self.leader_id.split('.')[-1]
+        return name.replace('_', ' ').title()
+
+    def serialize(self) -> bytes:
+        out = write_string(self.class_type)
+        out += b'\x01'
+        out += write_string(self.leader_id)
+        out += write_u32(len(self.stats))
+        for s in self.stats:
+            out += write_f32(s)
+        out += write_u32(len(self.perks))
+        for p in self.perks:
+            out += b'\x01' + write_string(p)
+        out += write_u32(len(self.equipment))
+        for slot in self.equipment:
+            out += slot.serialize()
+        out += self.mid_blob
+        out += write_string(self.status)
+        out += write_u32(len(self.known_leaders))
+        for kl in self.known_leaders:
+            out += write_u32(kl)
+        return out
+
+
+@dataclass
 class MenaceSave:
     """Parsed MENACE save file."""
     # Raw section blobs (for sections we don't fully parse)
@@ -138,6 +191,7 @@ class MenaceSave:
     catalog: list[CatalogItem] = field(default_factory=list)
     known_items: list[str] = field(default_factory=list)
     quality_items: list[QualityItem] = field(default_factory=list)
+    squad_leaders: list[SquadLeader] = field(default_factory=list)
 
     # Pre-catalog blob (everything before the catalog count)
     pre_catalog: bytes = b''
@@ -145,6 +199,9 @@ class MenaceSave:
     post_quality: bytes = b''
     # Blob between catalog and known items
     between_catalog_known: bytes = b''
+    # Blobs around squad leaders within post_quality
+    pre_squad_leaders: bytes = b''   # post_quality data before squad leader count
+    post_squad_leaders: bytes = b''  # post_quality data after last squad leader
 
 
 def increment_uuid(u: str) -> str:
@@ -243,7 +300,118 @@ def parse_save(filepath: str | Path) -> MenaceSave:
     save.quality_items_end = pos
     save.post_quality = data[pos:]
 
+    # ── Parse squad leaders from post_quality ─────────────────────────────
+    save.squad_leaders, save.pre_squad_leaders, save.post_squad_leaders = \
+        _parse_squad_leaders(save.post_quality)
+
     return save
+
+
+def _find_squad_leader_start(data: bytes) -> int | None:
+    """Find the offset of the squad leader count u32 within a data blob.
+
+    Looks for the pattern: u32(count) + string("Infantry"|"Vehicle") + 0x01 +
+    string("squad_leader.*"|"pilot.*")
+    """
+    import re
+    for m in re.finditer(b'(\x08Infantry|\x07Vehicle)\x01', data):
+        pos = m.end()
+        if pos >= len(data):
+            continue
+        slen = data[pos]
+        if pos + 1 + slen > len(data):
+            continue
+        name = data[pos + 1:pos + 1 + slen].decode('utf-8', errors='replace')
+        if 'squad_leader.' in name or 'pilot.' in name:
+            # Count u32 is 4 bytes before the class string
+            count_pos = m.start() - 4
+            if count_pos < 0:
+                continue
+            count = struct.unpack_from('<I', data, count_pos)[0]
+            if 1 <= count <= 20:  # sanity check
+                return count_pos
+    return None
+
+
+def _parse_squad_leaders(post_quality: bytes) -> tuple[list['SquadLeader'], bytes, bytes]:
+    """Parse squad leaders from post_quality blob.
+
+    Returns (squad_leaders, pre_blob, post_blob).
+    """
+    count_offset = _find_squad_leader_start(post_quality)
+    if count_offset is None:
+        return [], post_quality, b''
+
+    pre_blob = post_quality[:count_offset]
+    pos = count_offset
+    sl_count = struct.unpack_from('<I', post_quality, pos)[0]
+    pos += 4
+
+    leaders = []
+    for _ in range(sl_count):
+        class_type, pos = read_string(post_quality, pos)
+        _marker, pos = read_u8(post_quality, pos)
+        leader_id, pos = read_string(post_quality, pos)
+
+        stat_count, pos = read_u32(post_quality, pos)
+        stats = []
+        for _i in range(stat_count):
+            val, pos = read_f32(post_quality, pos)
+            stats.append(val)
+
+        perk_count, pos = read_u32(post_quality, pos)
+        perks = []
+        for _i in range(perk_count):
+            _m, pos = read_u8(post_quality, pos)
+            perk_name, pos = read_string(post_quality, pos)
+            perks.append(perk_name)
+
+        equip_count, pos = read_u32(post_quality, pos)
+        equipment = []
+        for _i in range(equip_count):
+            slot_id, pos = read_u32(post_quality, pos)
+            uuid_count, pos = read_u32(post_quality, pos)
+            slot_uuids = []
+            for _j in range(uuid_count):
+                uid, pos = read_string(post_quality, pos)
+                slot_uuids.append(uid)
+            equipment.append(EquipmentSlot(slot_id=slot_id, uuids=slot_uuids))
+
+        equip_end = pos
+
+        # Find status string ("Alive" or "Dead") — mid_blob is everything between
+        alive_pos = post_quality.find(b'\x05Alive', pos)
+        dead_pos = post_quality.find(b'\x04Dead', pos)
+        candidates = [(p, 'Alive') for p in [alive_pos] if 0 < p < pos + 3000]
+        candidates += [(p, 'Dead') for p in [dead_pos] if 0 < p < pos + 3000]
+        candidates.sort()
+
+        if not candidates:
+            raise ValueError(f"Could not find status for {leader_id}")
+
+        status_pos = candidates[0][0]
+        mid_blob = post_quality[equip_end:status_pos]
+
+        status, pos = read_string(post_quality, status_pos)
+        known_count, pos = read_u32(post_quality, pos)
+        known_leaders = []
+        for _i in range(known_count):
+            kl, pos = read_u32(post_quality, pos)
+            known_leaders.append(kl)
+
+        leaders.append(SquadLeader(
+            class_type=class_type,
+            leader_id=leader_id,
+            stats=stats,
+            perks=perks,
+            equipment=equipment,
+            mid_blob=mid_blob,
+            status=status,
+            known_leaders=known_leaders,
+        ))
+
+    post_blob = post_quality[pos:]
+    return leaders, pre_blob, post_blob
 
 
 def serialize_save(save: MenaceSave) -> bytes:
@@ -268,8 +436,13 @@ def serialize_save(save: MenaceSave) -> bytes:
     for qi in save.quality_items:
         out += qi.serialize()
 
-    # Everything after
-    out += save.post_quality
+    # Post-quality: pre_squad_leaders + squad leaders + post_squad_leaders
+    out += save.pre_squad_leaders
+    if save.squad_leaders:
+        out += write_u32(len(save.squad_leaders))
+        for sl in save.squad_leaders:
+            out += sl.serialize()
+    out += save.post_squad_leaders
 
     return bytes(out)
 

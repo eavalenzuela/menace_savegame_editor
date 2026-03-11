@@ -8,7 +8,7 @@ from pathlib import Path
 import uuid
 
 from menace_save import (
-    MenaceSave, CatalogItem,
+    MenaceSave, CatalogItem, SquadLeader,
     parse_save, serialize_save,
     increment_uuid,
 )
@@ -102,6 +102,8 @@ class MenaceEditor(tk.Tk):
         self.save: MenaceSave | None = None
         self.filepath: str | None = None
         self.stat_vars: list[tk.StringVar] = []
+        self.sl_stat_vars: dict[int, list[tk.StringVar]] = {}  # squad leader idx -> stat vars
+        self.sl_perk_vars: dict[int, dict[str, tk.BooleanVar]] = {}  # squad leader idx -> perk -> var
 
         self._build_ui()
 
@@ -135,6 +137,7 @@ class MenaceEditor(tk.Tk):
 
         self._build_inventory_tab()
         self._build_stats_tab()
+        self._build_squad_leaders_tab()
 
         # Right: details
         self.detail_frame = ttk.LabelFrame(paned, text="Details")
@@ -185,7 +188,7 @@ class MenaceEditor(tk.Tk):
 
     def _build_stats_tab(self):
         stats_outer = ttk.Frame(self.notebook)
-        self.notebook.add(stats_outer, text="Stats")
+        self.notebook.add(stats_outer, text="Global Values")
 
         canvas = tk.Canvas(stats_outer, highlightthickness=0)
         scrollbar = ttk.Scrollbar(stats_outer, orient=tk.VERTICAL, command=canvas.yview)
@@ -193,6 +196,35 @@ class MenaceEditor(tk.Tk):
 
         self.stats_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=self.stats_frame, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _build_squad_leaders_tab(self):
+        sl_outer = ttk.Frame(self.notebook)
+        self.notebook.add(sl_outer, text="Squad Leaders")
+
+        # Left: leader list
+        list_frame = ttk.Frame(sl_outer)
+        list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)
+
+        ttk.Label(list_frame, text="Leaders", font=("TkDefaultFont", 10, "bold")).pack(anchor=tk.W, padx=4)
+        self.sl_listbox = tk.Listbox(list_frame, width=22, exportselection=False)
+        self.sl_listbox.pack(fill=tk.Y, expand=True, padx=4, pady=4)
+        self.sl_listbox.bind("<<ListboxSelect>>", self._on_sl_select)
+
+        # Right: details (scrollable)
+        detail_outer = ttk.Frame(sl_outer)
+        detail_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        canvas = tk.Canvas(detail_outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(detail_outer, orient=tk.VERTICAL, command=canvas.yview)
+        self.sl_detail_frame = ttk.Frame(canvas)
+
+        self.sl_detail_frame.bind("<Configure>",
+                                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.sl_detail_frame, anchor=tk.NW)
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -225,12 +257,14 @@ class MenaceEditor(tk.Tk):
 
         self._refresh_tree()
         self._refresh_stats()
+        self._refresh_squad_leaders()
         self._clear_details()
 
     def _save_file(self):
         if not self.save or not self.filepath:
             return
         self._apply_stats()
+        self._apply_squad_leaders()
         self._do_save(self.filepath)
 
     def _save_file_as(self):
@@ -244,6 +278,7 @@ class MenaceEditor(tk.Tk):
         if not path:
             return
         self._apply_stats()
+        self._apply_squad_leaders()
         self._do_save(path)
 
     def _do_save(self, path: str):
@@ -432,6 +467,189 @@ class MenaceEditor(tk.Tk):
                 messagebox.showerror("Invalid value", f"{label} must be an integer.")
                 return
         self.save.pre_catalog = bytes(write_global_stats(bytearray(self.save.pre_catalog), stats))
+
+    # ── Squad Leaders tab ────────────────────────────────────────────────
+
+    STAT_NAMES = ["Accuracy", "Toughness", "Leadership", "Stat 4", "Stat 5", "Experience", "Morale"]
+
+    # Known perks per leader (union of observed perks across saves).
+    # Unique perks are listed first, then alphabetical.
+    KNOWN_PERKS: dict[str, list[str]] = {
+        "squad_leader.darby": [
+            "perk.unique_darby_high_value_targets",
+            "perk.ambush", "perk.athletic", "perk.commando", "perk.covert_ops",
+            "perk.impossible_shot", "perk.minimize_silhouette", "perk.scout",
+            "perk.sharpshooter", "perk.take_aim",
+        ],
+        "squad_leader.pike": [
+            "perk.stalwart_pike_unique",
+            "perk.athletic", "perk.call_out_target", "perk.determined",
+            "perk.fortify", "perk.inspiring_presence", "perk.new_tricks",
+            "perk.scout", "perk.solid_grouping", "perk.standby",
+            "perk.taking_command", "perk.this_is_my_rifle",
+        ],
+        "squad_leader.carda": [
+            "perk.unique_carda_out_of_the_craters",
+            "perk.athletic", "perk.first_aid", "perk.hit_the_deck",
+            "perk.scout", "perk.share_the_load", "perk.steady_gun",
+            "perk.stubborn", "perk.team_spirit",
+        ],
+        "squad_leader.wetteroth": [
+            "perk.unique_wetteroth_big_game_hunter",
+            "perk.buff", "perk.critical_hits", "perk.finisher",
+            "perk.finishing_shot", "perk.if_it_bleeds",
+            "perk.minimize_silhouette", "perk.scout",
+        ],
+        "squad_leader.greifinger": [
+            "perk.unique_greifinger_guerilla",
+            "perk.assassin", "perk.athletic", "perk.fortify",
+            "perk.recover", "perk.scout", "perk.sharpshooter",
+            "perk.tankbuster",
+        ],
+        "squad_leader.lim": [
+            "perk.unique_aspiring_lim",
+            "perk.athletic", "perk.berserk", "perk.counter_strike",
+            "perk.return_of_serve", "perk.run_and_gun", "perk.scout",
+            "perk.stubborn",
+        ],
+        "pilot.rewa": [
+            "perk.unique_rewa_revel_in_slaughter",
+            "perk.commando", "perk.expert_pilot_vehicle", "perk.grind_down",
+            "perk.roadkill", "perk.tankbuster", "perk.unbreakable_vehicle",
+            "perk.vanguard",
+        ],
+        "pilot.exconde": [
+            "perk.unique_sentry",
+            "perk.expert_pilot_vehicle", "perk.hotwire_vehicle",
+            "perk.scout", "perk.sharpshooter", "perk.tankbuster",
+            "perk.unbreakable_vehicle", "perk.zig_zag",
+        ],
+        "pilot.ivey": [
+            "perk.zero_in_starting",
+            "perk.barrage", "perk.demolitions_expert",
+            "perk.expert_pilot_vehicle", "perk.full_send", "perk.standby",
+            "perk.steady_gun", "perk.tankbuster", "perk.to_shreds_vehicle",
+        ],
+    }
+
+    def _refresh_squad_leaders(self):
+        self.sl_listbox.delete(0, tk.END)
+        self.sl_stat_vars.clear()
+        self.sl_perk_vars.clear()
+        for w in self.sl_detail_frame.winfo_children():
+            w.destroy()
+
+        if not self.save:
+            return
+
+        for sl in self.save.squad_leaders:
+            prefix = "SL" if "squad_leader" in sl.leader_id else "P"
+            self.sl_listbox.insert(tk.END, f"[{prefix}] {sl.display_name}")
+
+    def _on_sl_select(self, _event=None):
+        sel = self.sl_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self._show_squad_leader(idx)
+
+    def _show_squad_leader(self, idx: int):
+        for w in self.sl_detail_frame.winfo_children():
+            w.destroy()
+
+        sl = self.save.squad_leaders[idx]
+        row = 0
+
+        # Header
+        ttk.Label(self.sl_detail_frame, text=f"{sl.display_name}  ({sl.class_type})",
+                  font=("TkDefaultFont", 11, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(8, 2))
+        row += 1
+
+        ttk.Label(self.sl_detail_frame, text=f"Status: {sl.status}",
+                  foreground="green" if sl.status == "Alive" else "red").grid(
+            row=row, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(0, 6))
+        row += 1
+
+        # Stats
+        ttk.Label(self.sl_detail_frame, text="Stats",
+                  font=("TkDefaultFont", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(4, 2))
+        row += 1
+
+        stat_vars = []
+        for i, val in enumerate(sl.stats):
+            name = self.STAT_NAMES[i] if i < len(self.STAT_NAMES) else f"Stat {i+1}"
+            ttk.Label(self.sl_detail_frame, text=name).grid(
+                row=row, column=0, sticky=tk.W, padx=(16, 4), pady=1)
+            var = tk.StringVar(value=repr(val))
+            stat_vars.append(var)
+            ttk.Entry(self.sl_detail_frame, textvariable=var, width=20).grid(
+                row=row, column=1, sticky=tk.W, padx=(0, 8), pady=1)
+            row += 1
+
+        self.sl_stat_vars[idx] = stat_vars
+
+        # Perks
+        ttk.Separator(self.sl_detail_frame).grid(
+            row=row, column=0, columnspan=2, sticky=tk.EW, padx=8, pady=6)
+        row += 1
+
+        ttk.Label(self.sl_detail_frame, text="Perks",
+                  font=("TkDefaultFont", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(4, 2))
+        row += 1
+
+        perk_vars = {}
+        active_perks = set(sl.perks)
+
+        # Build full perk list: known perks for this leader + any unknown active perks
+        known = self.KNOWN_PERKS.get(sl.leader_id, [])
+        all_perks = list(known)
+        for p in sl.perks:
+            if p not in all_perks:
+                all_perks.append(p)
+
+        for perk in all_perks:
+            display = perk.removeprefix("perk.").replace("_", " ").title()
+            is_active = perk in active_perks
+            var = tk.BooleanVar(value=is_active)
+            perk_vars[perk] = var
+            cb = ttk.Checkbutton(self.sl_detail_frame, text=display, variable=var)
+            cb.grid(row=row, column=0, columnspan=2, sticky=tk.W, padx=16, pady=1)
+            row += 1
+
+        self.sl_perk_vars[idx] = perk_vars
+
+    def _apply_squad_leaders(self):
+        """Write squad leader edits back into save data."""
+        if not self.save:
+            return
+
+        for idx, stat_vars in self.sl_stat_vars.items():
+            sl = self.save.squad_leaders[idx]
+            new_stats = []
+            for i, var in enumerate(stat_vars):
+                try:
+                    new_stats.append(float(var.get()))
+                except ValueError:
+                    name = self.STAT_NAMES[i] if i < len(self.STAT_NAMES) else f"Stat {i+1}"
+                    messagebox.showerror("Invalid value",
+                                         f"{sl.display_name}: {name} must be a number.")
+                    return
+            sl.stats = new_stats
+
+        for idx, perk_vars in self.sl_perk_vars.items():
+            sl = self.save.squad_leaders[idx]
+            # Preserve original order for perks that remain active,
+            # then append any newly enabled perks at the end.
+            old_set = set(sl.perks)
+            new_active = {perk for perk, var in perk_vars.items() if var.get()}
+            new_perks = [p for p in sl.perks if p in new_active]  # keep original order
+            for perk, var in perk_vars.items():
+                if var.get() and perk not in old_set:
+                    new_perks.append(perk)
+            sl.perks = new_perks
 
 
 def main():
