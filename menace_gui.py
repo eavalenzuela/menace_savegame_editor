@@ -15,7 +15,6 @@ from menace_save import (
 
 # ── Global stats config ─────────────────────────────────────────────────────
 
-GLOBAL_STATS_OFFSET = 0x0095  # absolute file offset where stats begin
 GLOBAL_STATS_COUNT = 20
 
 STAT_LABELS = {
@@ -42,11 +41,28 @@ STAT_LABELS = {
 }
 
 
+def _find_stats_offset(data: bytes) -> int:
+    """Find the byte offset where global stats begin.
+
+    Stats follow the second occurrence of 'global_difficulty.normal'
+    in the pre-catalog header. The offset varies with header string lengths.
+    """
+    needle = b'global_difficulty.normal'
+    first = data.find(needle)
+    if first < 0:
+        raise ValueError("Could not find 'global_difficulty.normal' in header")
+    second = data.find(needle, first + len(needle))
+    if second < 0:
+        raise ValueError("Could not find second 'global_difficulty.normal' in header")
+    return second + len(needle)
+
+
 def read_global_stats(pre_catalog: bytes) -> list[int]:
     """Read global stats u32 values from pre_catalog blob."""
+    offset = _find_stats_offset(pre_catalog)
     stats = []
     for i in range(GLOBAL_STATS_COUNT):
-        off = GLOBAL_STATS_OFFSET + i * 4
+        off = offset + i * 4
         if off + 4 <= len(pre_catalog):
             val = struct.unpack_from('<I', pre_catalog, off)[0]
             stats.append(val)
@@ -58,8 +74,9 @@ def read_global_stats(pre_catalog: bytes) -> list[int]:
 def write_global_stats(pre_catalog: bytearray, stats: list[int]) -> bytearray:
     """Write global stats back into pre_catalog blob."""
     buf = bytearray(pre_catalog)
+    offset = _find_stats_offset(bytes(buf))
     for i, val in enumerate(stats):
-        off = GLOBAL_STATS_OFFSET + i * 4
+        off = offset + i * 4
         if off + 4 <= len(buf):
             struct.pack_into('<I', buf, off, val)
     return buf
@@ -384,6 +401,7 @@ class MenaceEditor(tk.Tk):
             return
 
         stats = read_global_stats(self.save.pre_catalog)
+        base_offset = _find_stats_offset(self.save.pre_catalog)
 
         ttk.Label(self.stats_frame, text="Global Stats",
                   font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, columnspan=2,
@@ -391,7 +409,7 @@ class MenaceEditor(tk.Tk):
 
         for i, val in enumerate(stats):
             label = STAT_LABELS.get(i, f"Stat #{i}")
-            offset = GLOBAL_STATS_OFFSET + i * 4
+            offset = base_offset + i * 4
             display = f"{label}  (0x{offset:04X})"
 
             ttk.Label(self.stats_frame, text=display).grid(row=i+1, column=0,
